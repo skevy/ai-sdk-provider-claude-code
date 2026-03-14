@@ -114,6 +114,7 @@ export const claudeCodeSettingsSchema = z
       .optional(),
     settingSources: z.array(z.enum(['user', 'project', 'local'])).optional(),
     streamingInput: z.enum(['auto', 'always', 'off']).optional(),
+    persistentSession: z.boolean().optional(),
     // Hooks and tool-permission callback (permissive validation of shapes)
     canUseTool: z
       .any()

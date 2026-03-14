@@ -264,6 +264,7 @@ console.log(result.object); // Matches the schema above
 - 🚀 Vercel AI SDK compatibility
 - 🔄 Streaming support
 - 💬 Multi-turn conversations
+- ♻️ Persistent sessions (keep process alive across turns)
 - 🎯 Native structured outputs with schema compliance for supported features
 - 🛑 AbortSignal support
 - 🔧 Tool management (MCP servers, permissions)
@@ -379,6 +380,49 @@ injector.inject('STOP!', (delivered) => {
 ```
 
 See [examples/message-injection.ts](examples/message-injection.ts) for complete examples including conditional injection and supervisor approval patterns.
+
+## Persistent Sessions
+
+By default, each `streamText()` call spawns a new Claude Code process. With `persistentSession: true`, the process stays alive across calls — subsequent messages are injected into the running session with zero restart overhead.
+
+**Key pattern**: Create the model instance **once** per session and reuse it. The persistent process state lives on the model instance.
+
+```typescript
+import { streamText } from 'ai';
+import { claudeCode, type ClaudeCodeLanguageModel } from 'ai-sdk-provider-claude-code';
+
+// Store model instances by session ID
+const sessions = new Map<string, ClaudeCodeLanguageModel>();
+
+function getModel(sessionId: string): ClaudeCodeLanguageModel {
+  let model = sessions.get(sessionId);
+  if (!model) {
+    model = claudeCode('sonnet', {
+      persistentSession: true,
+      sessionId,
+      canUseTool: myCanUseToolCallback, // optional — enables tool approval flow
+    }) as ClaudeCodeLanguageModel;
+    sessions.set(sessionId, model);
+  }
+  return model;
+}
+
+// Turn 1: spawns the Claude Code process
+const r1 = streamText({ model: getModel('session-1'), prompt: 'Analyze this codebase' });
+const text1 = await r1.text;
+
+// Turn 2: reuses the same process — no restart!
+const r2 = streamText({ model: getModel('session-1'), prompt: 'Now fix the bugs you found' });
+const text2 = await r2.text;
+
+// Clean up when done
+sessions.get('session-1')?.destroyPersistentSession();
+sessions.delete('session-1');
+```
+
+**Requirements**: `persistentSession` requires streaming input to be active — either set `streamingInput: 'always'` explicitly, or provide a `canUseTool` callback (which enables `streamingInput: 'auto'`).
+
+See [examples/persistent-session.ts](examples/persistent-session.ts) for a complete runnable example.
 
 ## Image Inputs (Streaming Only)
 

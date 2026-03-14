@@ -92,6 +92,14 @@ function isClaudeCodeTruncationError(error: unknown, bufferedText: string): bool
   return true;
 }
 
+function createDeferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 function isAbortError(err: unknown): boolean {
   if (err && typeof err === 'object') {
     const e = err as { name?: unknown; code?: unknown };
@@ -639,6 +647,16 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
   private settingsValidationWarnings: string[];
   private logger: Logger;
 
+  // Persistent session state for streamingInput: 'always' mode.
+  // When active, the query() process stays alive across doStream() calls.
+  private persistentStream?: {
+    injector: MessageInjector;
+    nextTurnReady: { promise: Promise<void>; resolve: () => void };
+    turnInterrupted: { promise: Promise<void>; resolve: () => void };
+    currentController: ReadableStreamDefaultController<ExtendedStreamPart> | null;
+    doneFn: () => void;
+  };
+
   constructor(options: ClaudeCodeLanguageModelOptions) {
     this.modelId = options.id;
     this.settings = options.settings ?? {};
@@ -665,6 +683,32 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
   get provider(): string {
     return 'claude-code';
+  }
+
+  /**
+   * Interrupt the current turn in a persistent session.
+   * The process stays alive but the current turn's stream is closed.
+   * Call this after `query.interrupt()` to properly hand off the iterator.
+   */
+  interruptPersistentTurn(): void {
+    if (this.persistentStream) {
+      this.persistentStream.turnInterrupted.resolve();
+    }
+  }
+
+  /**
+   * Destroy the persistent session, allowing the process to exit.
+   * Only relevant when streamingInput is 'always'.
+   */
+  destroyPersistentSession(): void {
+    if (this.persistentStream) {
+      try { this.persistentStream.currentController?.close(); } catch { /* already closed */ }
+      this.persistentStream.currentController = null;
+      this.persistentStream.doneFn();
+      this.persistentStream.turnInterrupted.resolve();
+      this.persistentStream.nextTurnReady.resolve();
+      this.persistentStream = undefined;
+    }
   }
 
   private getModel(): string {
@@ -1520,12 +1564,55 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       });
     }
 
+    const isPersistentMode = !!this.settings.persistentSession && wantsStreamInput;
+
+    // Subsequent turn on a persistent session: inject message, create a fresh
+    // per-turn stream, and unblock the for-await loop from the first doStream call.
+    if (isPersistentMode && this.persistentStream) {
+      this.logger.debug(`[claude-code] Persistent session: subsequent doStream called, currentController=${!!this.persistentStream.currentController}`);
+      const persistent = this.persistentStream;
+
+      const turnStream = new ReadableStream<ExtendedStreamPart>({
+        start: (controller) => {
+          this.logger.debug('[claude-code] Persistent session: new turn stream started, setting controller');
+          controller.enqueue({ type: 'stream-start', warnings });
+          persistent.currentController = controller;
+          // Unblock the for-await loop waiting in the first doStream's start callback
+          persistent.nextTurnReady.resolve();
+          this.logger.debug('[claude-code] Persistent session: nextTurnReady resolved');
+        },
+        cancel: () => {
+          this.logger.debug('[claude-code] Persistent session: turn stream cancelled');
+          persistent.currentController = null;
+        },
+      });
+
+      // Inject the new user message into the running process
+      this.logger.debug(`[claude-code] Persistent session: injecting message (${messagesPrompt.length} chars)`);
+      persistent.injector.inject(messagesPrompt);
+
+      return {
+        stream: turnStream as unknown as ReadableStream<LanguageModelV3StreamPart>,
+        request: {},
+        response: {},
+      };
+    }
+
     const stream = new ReadableStream<ExtendedStreamPart>({
-      start: async (controller) => {
-        let done = () => {};
-        const outputStreamEnded = new Promise((resolve) => {
-          done = () => resolve(undefined);
-        });
+      start: async (rawController) => {
+        // In persistent mode, the controller changes between turns.
+        // Use a simple wrapper that delegates to the current turn's controller.
+        let activeController = rawController;
+        const controller = isPersistentMode
+          ? {
+              enqueue: (chunk: ExtendedStreamPart) => activeController.enqueue(chunk),
+              close: () => activeController.close(),
+              error: (e: unknown) => activeController.error(e),
+              get desiredSize() { return activeController.desiredSize; },
+            }
+          : rawController;
+
+        const { promise: outputStreamEnded, resolve: done } = createDeferred();
         const toolStates = new Map<string, ToolStreamState>();
         // Track active Task tools for subagent hierarchy
         // Using a Map instead of stack to correctly handle parallel agents
@@ -1607,6 +1694,43 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         const reasoningBlocksByIndex = new Map<number, string>();
         let currentReasoningPartId: string | undefined;
 
+        const resetTurnState = () => {
+          textPartId = undefined;
+          toolStates.clear();
+          activeTaskTools.clear();
+          accumulatedText = '';
+          streamedTextLength = 0;
+          hasReceivedStreamEvents = false;
+          hasStreamedJson = false;
+          toolBlocksByIndex.clear();
+          toolInputAccumulators.clear();
+          textBlocksByIndex.clear();
+          textStreamedViaContentBlock = false;
+          reasoningBlocksByIndex.clear();
+          currentReasoningPartId = undefined;
+          usage = createEmptyUsage();
+          streamWarnings.length = 0;
+        };
+
+        // Shared turn-boundary logic: close current turn, wait for next doStream() call.
+        // Returns true if a new turn started, false if the session was destroyed.
+        const waitForNextTurn = async (reason: string): Promise<boolean> => {
+          if (!this.persistentStream) return false;
+          this.persistentStream.currentController = null;
+          resetTurnState();
+          this.persistentStream.nextTurnReady = createDeferred();
+          this.persistentStream.turnInterrupted = createDeferred();
+          this.logger.debug(`[claude-code] Persistent session: waiting for next turn (after ${reason})`);
+          await this.persistentStream.nextTurnReady.promise;
+          if (!this.persistentStream) {
+            this.logger.debug('[claude-code] Persistent session: destroyed while waiting');
+            return false;
+          }
+          activeController = this.persistentStream.currentController!;
+          this.logger.debug(`[claude-code] Persistent session: next turn started (after ${reason})`);
+          return true;
+        };
+
         try {
           // Emit stream-start with warnings
           controller.enqueue({ type: 'stream-start', warnings });
@@ -1618,13 +1742,28 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           }
           // hold input stream open until results
           // see: https://github.com/anthropics/claude-code/issues/4775
+
+          // In persistent mode, wrap onStreamStart to capture the injector
+          const onStreamStartWrapper = isPersistentMode
+            ? (injector: MessageInjector) => {
+                this.persistentStream = {
+                  injector,
+                  nextTurnReady: createDeferred(),
+                  turnInterrupted: createDeferred(),
+                  currentController: controller,
+                  doneFn: done,
+                };
+                this.settings.onStreamStart?.(injector);
+              }
+            : this.settings.onStreamStart;
+
           const sdkPrompt = wantsStreamInput
             ? toAsyncIterablePrompt(
                 messagesPrompt,
                 outputStreamEnded,
                 effectiveResume,
                 streamingContentParts,
-                this.settings.onStreamStart
+                onStreamStartWrapper
               )
             : messagesPrompt;
 
@@ -1641,7 +1780,82 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           // like mid-stream message injection via query.streamInput()
           this.settings.onQueryCreated?.(response);
 
-          for await (const message of response) {
+          // Use manual iteration instead of for-await to avoid auto-closing the
+          // iterator on break (for-await calls .return() which closes the Query).
+          // In persistent mode, the iterator must survive across turns.
+          const responseIterator = response[Symbol.asyncIterator]();
+          const TURN_INTERRUPTED = Symbol('turn-interrupted');
+          while (true) {
+            // In persistent mode, race the iterator with a turn-interrupt signal.
+            // When interrupt() is called externally, the signal fires and we
+            // break out of the iterator wait to do the turn-boundary handoff.
+            const iterResult = isPersistentMode && this.persistentStream
+              ? await Promise.race([
+                  responseIterator.next(),
+                  this.persistentStream.turnInterrupted.promise.then(
+                    () => TURN_INTERRUPTED as typeof TURN_INTERRUPTED
+                  ),
+                ])
+              : await responseIterator.next();
+
+            if (iterResult === TURN_INTERRUPTED) {
+              this.logger.debug('[claude-code] Persistent session: turn interrupted externally');
+              try { activeController.close(); } catch { /* already closed */ }
+              const resumed = await waitForNextTurn('interrupt');
+              if (!resumed) break;
+
+              // Drain the stale result event from the interrupted turn.
+              // query.interrupt() causes the process to emit a result message
+              // that's still buffered in the iterator.
+              try {
+                let iteratorEnded = false;
+                for (;;) {
+                  const drainResult = await responseIterator.next();
+                  if (drainResult.done) {
+                    this.logger.debug('[claude-code] Persistent session: iterator ended while draining');
+                    iteratorEnded = true;
+                    break;
+                  }
+                  this.logger.debug(`[claude-code] Persistent session: draining post-interrupt event: ${drainResult.value.type}`);
+                  if (drainResult.value.type === 'result') {
+                    break;
+                  }
+                }
+                if (iteratorEnded) break;
+              } catch (drainErr) {
+                this.logger.warn(`[claude-code] Persistent session: error draining post-interrupt events: ${drainErr}`);
+                break;
+              }
+              continue;
+            }
+
+            // Narrow type after symbol check
+            const iterMsg = iterResult as IteratorResult<import('@anthropic-ai/claude-agent-sdk').SDKMessage, void>;
+            if (iterMsg.done) {
+              this.logger.debug('[claude-code] Persistent session: iterator done');
+              break;
+            }
+            const message = iterMsg.value;
+            // In persistent mode, verify the controller is still usable before processing.
+            // The AI SDK consumer may cancel the stream between events.
+            if (isPersistentMode && this.persistentStream) {
+              const ctrl = this.persistentStream.currentController;
+              if (!ctrl) {
+                this.logger.debug(`[claude-code] Persistent session: controller gone (nulled), skipping event: ${message.type}`);
+                continue;
+              }
+              try {
+                // Test if controller is alive by checking desiredSize
+                // (closed controllers throw on property access in some implementations)
+                void ctrl.desiredSize;
+              } catch {
+                this.logger.debug(`[claude-code] Persistent session: controller closed, event: ${message.type}`);
+                // Controller was closed by the consumer — wait for next turn
+                const resumed = await waitForNextTurn('controller-closed');
+                if (!resumed) break;
+                continue;
+              }
+            }
             this.logger.debug(`[claude-code] Stream received message type: ${message.type}`);
 
             // Handle streaming events (token-by-token delivery via includePartialMessages)
@@ -2380,7 +2594,10 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 } as any); // eslint-disable-line @typescript-eslint/no-explicit-any
               }
             } else if (message.type === 'result') {
-              done();
+              // In persistent mode, don't call done() — keeps the input iterator alive
+              if (!isPersistentMode) {
+                done();
+              }
 
               // Handle is_error flag in result message (e.g., auth failures)
               // The CLI returns successful JSON with is_error: true and error message in result field
@@ -2492,6 +2709,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               // Prepare JSON-safe warnings for provider metadata
               const warningsJson = this.serializeWarningsForMetadata(streamWarnings);
 
+              // The proxy controller routes to the correct per-turn controller
               controller.enqueue({
                 type: 'finish',
                 finishReason,
@@ -2506,17 +2724,23 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     ...(message.modelUsage !== undefined && {
                       modelUsage: message.modelUsage as unknown as JSONValue,
                     }),
-                    // JSON validation warnings are collected during streaming and included
-                    // in providerMetadata since the AI SDK's finish event doesn't support
-                    // a top-level warnings field (unlike stream-start which was already emitted)
                     ...(streamWarnings.length > 0 && {
                       warnings: warningsJson as unknown as JSONValue,
                     }),
                   },
                 },
               });
-              controller.close();
-              return;
+
+              if (isPersistentMode && this.persistentStream) {
+                this.logger.debug('[claude-code] Persistent session: result received, closing per-turn stream');
+                activeController.close();
+                const resumed = await waitForNextTurn('result');
+                if (!resumed) break;
+                continue;
+              } else {
+                controller.close();
+                return;
+              }
             } else if (message.type === 'system' && message.subtype === 'init') {
               this.logMcpConnectionIssues(message.mcp_servers);
 
@@ -2525,20 +2749,32 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
               this.logger.info(`[claude-code] Stream session initialized: ${message.session_id}`);
 
-              // Emit response metadata when session is initialized
-              controller.enqueue({
-                type: 'response-metadata',
-                id: message.session_id,
-                timestamp: new Date(),
-                modelId: this.modelId,
-              });
+              // Only emit response-metadata on the first init (not on subsequent
+              // turns in persistent mode, where the session is already initialized).
+              if (!isPersistentMode || !this.persistentStream) {
+                controller.enqueue({
+                  type: 'response-metadata',
+                  id: message.session_id,
+                  timestamp: new Date(),
+                  modelId: this.modelId,
+                });
+              }
             }
           }
 
           finalizeToolCalls();
           this.logger.debug('[claude-code] Stream finalized, closing stream');
+          // Clean up persistent session if the process exited
+          if (this.persistentStream) {
+            this.logger.info('[claude-code] Persistent session ended (process exited)');
+            this.persistentStream = undefined;
+          }
           controller.close();
         } catch (error: unknown) {
+          // Clean up persistent session on error
+          if (this.persistentStream) {
+            this.persistentStream = undefined;
+          }
           done();
 
           this.logger.debug(

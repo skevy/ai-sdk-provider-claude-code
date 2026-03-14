@@ -272,6 +272,54 @@ export interface ClaudeCodeSettings {
   streamingInput?: StreamingInputMode;
 
   /**
+   * Keep the Claude Code process alive across multiple `streamText()` calls.
+   * Requires `streamingInput` to be 'always' or 'auto' with `canUseTool`.
+   *
+   * When enabled, the first `streamText()` call spawns the process. Subsequent
+   * calls inject messages into the running process via the `MessageInjector`,
+   * avoiding process restart overhead. Each call still returns an independent
+   * per-turn stream that the AI SDK processes normally.
+   *
+   * **Important**: you must create the model instance ONCE and reuse it across
+   * calls. The persistent process state is held on the model instance. Creating
+   * a new `claudeCode()` instance per request defeats the purpose.
+   *
+   * Use `destroyPersistentSession()` on the model instance to explicitly
+   * shut down the persistent process.
+   *
+   * @default false
+   *
+   * @example
+   * ```typescript
+   * // Create once per session and store for reuse
+   * const sessions = new Map<string, ClaudeCodeLanguageModel>();
+   *
+   * function getModel(sessionId: string) {
+   *   let model = sessions.get(sessionId);
+   *   if (!model) {
+   *     model = claudeCode('sonnet', {
+   *       persistentSession: true,
+   *       sessionId,
+   *     }) as ClaudeCodeLanguageModel;
+   *     sessions.set(sessionId, model);
+   *   }
+   *   return model;
+   * }
+   *
+   * // Turn 1: spawns the process
+   * const r1 = streamText({ model: getModel('sess-1'), prompt: 'Hello' });
+   *
+   * // Turn 2: reuses the same process (no restart)
+   * const r2 = streamText({ model: getModel('sess-1'), prompt: 'Follow up' });
+   *
+   * // Clean up
+   * sessions.get('sess-1')?.destroyPersistentSession();
+   * sessions.delete('sess-1');
+   * ```
+   */
+  persistentSession?: boolean;
+
+  /**
    * Enable verbose logging for debugging
    */
   verbose?: boolean;
